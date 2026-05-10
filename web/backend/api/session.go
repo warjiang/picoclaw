@@ -732,7 +732,11 @@ func visibleAssistantToolArgsPreview(
 	return utils.VisibleToolCallArgumentsPreview(tc, toolFeedbackMaxArgsLength)
 }
 
-func visibleAssistantToolMessages(toolCalls []providers.ToolCall, modelName string, createdAt *time.Time) []sessionChatMessage {
+func visibleAssistantToolMessages(
+	toolCalls []providers.ToolCall,
+	modelName string,
+	createdAt *time.Time,
+) []sessionChatMessage {
 	if len(toolCalls) == 0 {
 		return nil
 	}
