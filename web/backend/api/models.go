@@ -18,29 +18,16 @@ import (
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
-// fetchableProviders lists providers that support OpenAI-compatible /models listing.
-var fetchableProviders = map[string]bool{
-	"openai": true, "deepseek": true, "openrouter": true,
-	"qwen-portal": true, "qwen-intl": true, "moonshot": true,
-	"volcengine": true, "zhipu": true, "groq": true,
-	"mistral": true, "nvidia": true, "cerebras": true,
-	"venice": true, "shengsuanyun": true, "vivgrid": true,
-	"siliconflow": true,
-	"minimax":     true, "longcat": true, "modelscope": true,
-	"mimo": true, "avian": true, "zai": true, "novita": true,
-	"litellm": true, "vllm": true, "lmstudio": true, "ollama": true,
-}
-
 // registerModelRoutes binds model list management endpoints to the ServeMux.
 func (h *Handler) registerModelRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/models", h.handleListModels)
+	mux.HandleFunc("POST /api/models/fetch", h.handleFetchModels)
+	mux.HandleFunc("GET /api/models/catalog", h.handleListCatalogs)
+	mux.HandleFunc("DELETE /api/models/catalog/{id}", h.handleDeleteCatalog)
 	mux.HandleFunc("POST /api/models", h.handleAddModel)
 	mux.HandleFunc("POST /api/models/default", h.handleSetDefaultModel)
 	mux.HandleFunc("PUT /api/models/{index}", h.handleUpdateModel)
 	mux.HandleFunc("DELETE /api/models/{index}", h.handleDeleteModel)
-	mux.HandleFunc("POST /api/models/fetch", h.handleFetchModels)
-	mux.HandleFunc("GET /api/models/catalog", h.handleListCatalogs)
-	mux.HandleFunc("DELETE /api/models/catalog/{id}", h.handleDeleteCatalog)
 	mux.HandleFunc("POST /api/models/{index}/test", h.handleTestModel)
 	mux.HandleFunc("POST /api/models/test-inline", h.handleTestInlineModel)
 }
@@ -57,15 +44,16 @@ type modelResponse struct {
 	Proxy      string `json:"proxy,omitempty"`
 	AuthMethod string `json:"auth_method,omitempty"`
 	// Advanced fields
-	ConnectMode         string            `json:"connect_mode,omitempty"`
-	Workspace           string            `json:"workspace,omitempty"`
-	RPM                 int               `json:"rpm,omitempty"`
-	MaxTokensField      string            `json:"max_tokens_field,omitempty"`
-	RequestTimeout      int               `json:"request_timeout,omitempty"`
-	ThinkingLevel       string            `json:"thinking_level,omitempty"`
-	ToolSchemaTransform string            `json:"tool_schema_transform,omitempty"`
-	ExtraBody           map[string]any    `json:"extra_body,omitempty"`
-	CustomHeaders       map[string]string `json:"custom_headers,omitempty"`
+	ConnectMode         string                      `json:"connect_mode,omitempty"`
+	Workspace           string                      `json:"workspace,omitempty"`
+	RPM                 int                         `json:"rpm,omitempty"`
+	MaxTokensField      string                      `json:"max_tokens_field,omitempty"`
+	RequestTimeout      int                         `json:"request_timeout,omitempty"`
+	ThinkingLevel       string                      `json:"thinking_level,omitempty"`
+	ToolSchemaTransform string                      `json:"tool_schema_transform,omitempty"`
+	Streaming           config.ModelStreamingConfig `json:"streaming,omitempty"`
+	ExtraBody           map[string]any              `json:"extra_body,omitempty"`
+	CustomHeaders       map[string]string           `json:"custom_headers,omitempty"`
 	// Meta
 	Enabled             bool   `json:"enabled"`
 	Available           bool   `json:"available"`
@@ -293,6 +281,7 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 			RequestTimeout:      m.RequestTimeout,
 			ThinkingLevel:       m.ThinkingLevel,
 			ToolSchemaTransform: m.ToolSchemaTransform,
+			Streaming:           m.Streaming,
 			ExtraBody:           m.ExtraBody,
 			CustomHeaders:       m.CustomHeaders,
 			Enabled:             m.Enabled,
@@ -440,6 +429,9 @@ func (h *Handler) handleUpdateModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := rawFields["tool_schema_transform"]; !ok {
 		mc.ToolSchemaTransform = cfg.ModelList[idx].ToolSchemaTransform
+	}
+	if _, ok := rawFields["streaming"]; !ok {
+		mc.Streaming = cfg.ModelList[idx].Streaming
 	}
 	// Preserve the existing Provider when the caller omits it. This keeps the
 	// update API backward-compatible for clients that haven't started sending
@@ -648,9 +640,10 @@ func (h *Handler) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req struct {
-		Provider string `json:"provider"`
-		APIKey   string `json:"api_key"`
-		APIBase  string `json:"api_base"`
+		Provider   string `json:"provider"`
+		APIKey     string `json:"api_key"`
+		APIBase    string `json:"api_base"`
+		ModelIndex *int   `json:"model_index,omitempty"`
 	}
 	if err = json.Unmarshal(body, &req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
@@ -662,12 +655,20 @@ func (h *Handler) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !fetchableProviders[strings.ToLower(req.Provider)] {
+	if !providers.IsModelProviderFetchable(req.Provider) {
 		http.Error(w, fmt.Sprintf("provider %q does not support model listing", req.Provider), http.StatusBadRequest)
 		return
 	}
 
+	apiKey := strings.TrimSpace(req.APIKey)
 	apiBase := strings.TrimSpace(req.APIBase)
+
+	if apiKey == "" && req.ModelIndex != nil {
+		if stored := h.lookupStoredAPIKey(*req.ModelIndex, req.Provider, apiBase); stored != "" {
+			apiKey = stored
+		}
+	}
+
 	if apiBase == "" {
 		apiBase = providers.DefaultAPIBaseForProtocol(req.Provider)
 	}
@@ -679,7 +680,7 @@ func (h *Handler) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	models, err := fetchUpstreamModels(ctx, req.Provider, apiBase, req.APIKey)
+	models, err := fetchUpstreamModels(ctx, req.Provider, apiBase, apiKey)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch models: %v", err), http.StatusBadGateway)
 		return
@@ -690,7 +691,7 @@ func (h *Handler) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	for i, m := range models {
 		catalogModels[i] = CatalogModel{ID: m.ID, OwnedBy: m.OwnedBy}
 	}
-	if saveErr := SaveCatalog(req.Provider, apiBase, req.APIKey, catalogModels); saveErr != nil {
+	if saveErr := SaveCatalog(req.Provider, apiBase, apiKey, catalogModels); saveErr != nil {
 		// Log but don't fail the request — saving catalog is non-critical
 		logger.Warnf("Failed to save model catalog: %v", saveErr)
 	}
@@ -700,6 +701,30 @@ func (h *Handler) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 		"models": models,
 		"total":  len(models),
 	})
+}
+
+func (h *Handler) lookupStoredAPIKey(index int, reqProvider, reqAPIBase string) string {
+	cfg, err := config.LoadConfig(h.configPath)
+	if err != nil || index < 0 || index >= len(cfg.ModelList) {
+		return ""
+	}
+	stored := cfg.ModelList[index]
+	storedProvider, _ := providers.ExtractProtocol(stored)
+	if providers.NormalizeProvider(reqProvider) != providers.NormalizeProvider(storedProvider) {
+		return ""
+	}
+	effectiveReqBase := strings.TrimSpace(reqAPIBase)
+	if effectiveReqBase == "" {
+		effectiveReqBase = providers.DefaultAPIBaseForProtocol(reqProvider)
+	}
+	effectiveStoredBase := strings.TrimSpace(stored.APIBase)
+	if effectiveStoredBase == "" {
+		effectiveStoredBase = providers.DefaultAPIBaseForProtocol(storedProvider)
+	}
+	if normalizeAPIBaseForCompare(effectiveReqBase) != normalizeAPIBaseForCompare(effectiveStoredBase) {
+		return ""
+	}
+	return stored.APIKey()
 }
 
 type upstreamModel struct {
@@ -1005,13 +1030,13 @@ func probeModelConnectivity(m *config.ModelConfig) bool {
 	switch protocol {
 	case "ollama":
 		return probeOllamaModel(apiBase, modelID)
-	case "vllm", "lmstudio":
+	case "vllm", "lmstudio", "gpt4free":
 		return probeOpenAICompatibleModel(apiBase, modelID, m.APIKey())
-	case "github-copilot", "copilot":
+	case "github-copilot":
 		return probeTCPService(apiBase)
-	case "claude-cli", "claudecli":
+	case "claude-cli":
 		return probeCommandAvailable("claude")
-	case "codex-cli", "codexcli":
+	case "codex-cli":
 		return probeCommandAvailable("codex")
 	default:
 		// For remote providers (OpenAI, Anthropic, Gemini, DeepSeek, etc.),
